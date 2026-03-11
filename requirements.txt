@@ -1,0 +1,5 @@
+ollama
+pypdf
+fastapi
+uvicorn
+python-multipart

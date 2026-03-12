@@ -59,4 +59,3 @@ http://localhost:8000/
 
 Upload a PDF or text file and click **Upload & analyze**.  
 The page will show a loading indicator and then display **"Invoice uploaded"** or **"PO uploaded"**.
-

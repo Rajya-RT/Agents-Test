@@ -15,6 +15,16 @@ class ClassificationResult(TypedDict):
     type: DocumentType
     confidence: float
     explanation: str
+    # Holds the structured fields extracted from the document
+    # For invoices:
+    #   - invoice_number
+    #   - customer
+    #   - invoice_date
+    # For purchase orders:
+    #   - order_number
+    #   - customer
+    #   - date
+    fields: dict[str, str]
 
 
 SYSTEM_PROMPT = """You are a document classifier for the company Red Thread.
@@ -35,6 +45,41 @@ Return your answer strictly as a JSON object with this schema:
   "type": "invoice" | "purchase_order",
   "confidence": number between 0 and 1,
   "explanation": "short natural language explanation"
+}
+
+Do not include any extra text outside the JSON.
+"""
+
+
+EXTRACTION_SYSTEM_PROMPT = """You are an information extraction assistant for Red Thread.
+
+You will receive:
+- the full text of a single business document sent to or from Red Thread
+- and a label telling you whether it is an "invoice" or a "purchase_order".
+
+Your job:
+- If the document is an INVOICE, extract:
+  - "invoice_number": the main invoice number (Invoice #, Invoice No, etc.)
+  - "customer": the customer company that the invoice is billed TO (who receives invoice from Red Thread)
+  - "invoice_date": the invoice date
+
+- If the document is a PURCHASE ORDER, extract:
+  - "order_number": the purchase order number (PO #, Order #, etc.)
+  - "customer": the customer company sending the PO to Red Thread (generally under a TO / Bill To / Sold To section)
+  - "date": the PO date
+
+Rules:
+- Prefer clearly labeled fields ("Invoice #", "PO #", "Order Number", "Invoice Date", "Date", "Customer", "Bill To", "Sold To") over guessing.
+- If a field truly cannot be found, set its value to an empty string "".
+- Keep values concise and human-readable (no surrounding labels or extra commentary).
+
+Return your answer strictly as JSON with this schema:
+{
+  "fields": {
+    "invoice_number" | "order_number": "string",
+    "customer": "string",
+    "invoice_date" | "date": "string"
+  }
 }
 
 Do not include any extra text outside the JSON.
@@ -101,11 +146,57 @@ Document content:
     confidence = float(data.get("confidence", 0.0))
     explanation = str(data.get("explanation", "")).strip()
 
+    # `fields` will be filled in later by the extraction call
     return {
         "type": doc_type,  # type: ignore[typeddict-item]
         "confidence": confidence,
         "explanation": explanation,
+        "fields": {},
     }
+
+
+def call_ollama_extractor(
+    text: str, doc_type: DocumentType, model: str = "gpt-oss:20b"
+) -> dict[str, str]:
+    """
+    Ask the model to pull out the key business fields
+    based on whether the document is an invoice or purchase order.
+    """
+    max_chars = 12000
+    snippet = text[:max_chars]
+
+    user_prompt = f"""Extract the key fields for this {doc_type} document.
+
+Document content:
+\"\"\"{snippet}\"\"\""""
+
+    response = ollama.chat(
+        model=model,
+        messages=[
+            {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+    )
+
+    content = response["message"]["content"]
+    content_stripped = content.strip()
+    if content_stripped.startswith("```"):
+        content_stripped = content_stripped.strip("`")
+    start = content_stripped.find("{")
+    end = content_stripped.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        json_str = content_stripped[start : end + 1]
+    else:
+        json_str = content_stripped
+
+    import json
+
+    data = json.loads(json_str)
+    fields = data.get("fields")
+    if not isinstance(fields, dict):
+        raise ValueError("Extractor response did not contain a 'fields' object")
+    # Normalize keys to simple strings
+    return {str(k): str(v) for k, v in fields.items()}
 
 
 app = FastAPI(title="Red Thread Document Classifier")
@@ -196,6 +287,25 @@ async def index() -> str:
       font-size: 17px;
       font-weight: 600;
     }
+    .result-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 10px;
+      font-size: 14px;
+      text-align: left;
+    }
+    .result-table th,
+    .result-table td {
+      padding: 8px 10px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.18);
+    }
+    .result-table th {
+      font-weight: 600;
+      text-transform: uppercase;
+      font-size: 12px;
+      letter-spacing: 0.06em;
+      opacity: 0.85;
+    }
     .spinner {
       margin: 10px auto 0;
       border: 3px solid rgba(255,255,255,0.25);
@@ -263,13 +373,52 @@ async def index() -> str:
         } else {
           const data = await response.json();
           statusEl.textContent = "Analysis complete.";
+
+          const docLabel =
+            data.type === "invoice"
+              ? "Invoice"
+              : data.type === "purchase_order"
+              ? "Purchase Order"
+              : "Unknown document";
+
+          const fields = data.fields || {};
+
+          const rows = [];
           if (data.type === "invoice") {
-            resultEl.textContent = "Invoice uploaded";
+            rows.push(["Invoice #", fields.invoice_number || ""]);
+            rows.push(["Customer", fields.customer || ""]);
+            rows.push(["Invoice date", fields.invoice_date || ""]);
           } else if (data.type === "purchase_order") {
-            resultEl.textContent = "PO uploaded";
+            rows.push(["Order #", fields.order_number || ""]);
+            rows.push(["Customer", fields.customer || ""]);
+            rows.push(["Date", fields.date || ""]);
           } else {
-            resultEl.textContent = "Unexpected result: " + JSON.stringify(data);
+            for (const [k, v] of Object.entries(fields)) {
+              rows.push([k, v]);
+            }
           }
+
+          const rowsHtml = rows
+            .map(
+              ([label, value]) =>
+                `<tr><td>${label}</td><td>${value || "<span style='opacity:0.6'>(not found)</span>"}</td></tr>`
+            )
+            .join("");
+
+          resultEl.innerHTML = `
+            <div>${docLabel} detected</div>
+            <table class="result-table">
+              <thead>
+                <tr>
+                  <th>Field</th>
+                  <th>Value</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${rowsHtml}
+              </tbody>
+            </table>
+          `;
         }
       } catch (err) {
         statusEl.textContent = "Failed to reach server.";
@@ -293,7 +442,17 @@ async def classify(file: UploadFile = File(...)) -> ClassificationResult:
         if not text.strip():
             raise HTTPException(status_code=400, detail="File appears to be empty or unreadable.")
 
+        # First classify the document (invoice vs purchase order)
         result = call_ollama_classifier(text)
+
+        # Then extract key business fields based on the inferred type
+        try:
+            extracted_fields = call_ollama_extractor(text, result["type"])
+        except Exception:
+            # If extraction fails, still return the classification
+            extracted_fields = {}
+
+        result["fields"] = extracted_fields
         return result
     except HTTPException:
         raise
